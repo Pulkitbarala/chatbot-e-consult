@@ -23,7 +23,25 @@ try {
 }
 
 const app = express();
-app.use(cors());
+
+const rawCorsOrigins = process.env.CORS_ORIGINS || '';
+const corsOrigins = rawCorsOrigins
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+const allowAllOrigins = corsOrigins.length === 0 || corsOrigins.includes('*');
+const allowedOrigins = corsOrigins.filter(origin => origin !== '*');
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowAllOrigins) return callback(null, true);
+    return callback(null, allowedOrigins.includes(origin));
+  },
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
 app.use(bodyParser.json({ limit: '2mb' }));
 
 let ragService;
