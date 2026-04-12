@@ -13,12 +13,22 @@ const STOPWORDS = new Set([
   'really', 'more', 'most', 'less', 'least', 'have', 'has', 'had', 'having', 'also', 'too', 'than', 'such'
 ]);
 
-const DEFAULT_TOP_K = 8;
-const DEFAULT_SUMMARY_TOP_K = 12;
-const MAX_CONTEXT_CHARS = 4000;
-const EMBEDDING_BATCH_SIZE = 24;
-const HISTORY_LIMIT = 6;
-const MAX_EMBED_TEXT_CHARS = 1200;
+function toInt(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+const DEFAULT_TOP_K = toInt(process.env.RAG_TOP_K, 16);
+const DEFAULT_SUMMARY_TOP_K = toInt(process.env.RAG_SUMMARY_TOP_K, 24);
+const MAX_CONTEXT_CHARS = toInt(process.env.RAG_MAX_CONTEXT_CHARS, 8000);
+const EMBEDDING_BATCH_SIZE = toInt(process.env.RAG_EMBED_BATCH_SIZE, 24);
+const HISTORY_LIMIT = toInt(process.env.RAG_HISTORY_LIMIT, 6);
+const MAX_EMBED_TEXT_CHARS = toInt(process.env.RAG_MAX_EMBED_TEXT_CHARS, 1200);
+const SUMMARY_THRESHOLD = toInt(process.env.RAG_SUMMARY_THRESHOLD, 120);
+const SUMMARY_CHUNK_SIZE = toInt(process.env.RAG_SUMMARY_CHUNK_SIZE, 40);
+const SUMMARY_CHUNK_MAX_TOKENS = toInt(process.env.RAG_SUMMARY_CHUNK_MAX_TOKENS, 320);
+const ANSWER_MAX_TOKENS = toInt(process.env.RAG_MAX_TOKENS || process.env.OPENROUTER_MAX_TOKENS, 1200);
+const MAP_REDUCE_ENABLED = String(process.env.RAG_MAP_REDUCE || 'true').toLowerCase() !== 'false';
 
 let cachedSupabase;
 
@@ -185,7 +195,8 @@ function buildSystemPrompt(intent) {
   const base = [
     'You are an assistant for analyzing user comment feedback.',
     'Use ONLY the provided comment context. If the answer is not in the context, say you do not have enough info.',
-    'Keep the response concise and professional.'
+    'When referencing specific details, cite the comment number in brackets (e.g., [3]).',
+    'Keep the response concise, factual, and professional.'
   ];
   const intentGuide = {
     summary: 'Provide a 4-6 sentence summary and then 3-5 bullet key points.',
@@ -203,18 +214,87 @@ function buildUserPrompt(intent, question) {
   return String(question || '').trim();
 }
 
-function buildContext(matches, filter) {
+function buildContext(matches, filter, maxChars = MAX_CONTEXT_CHARS) {
   let total = 0;
   const lines = [];
   for (let i = 0; i < matches.length; i++) {
     const m = matches[i];
     const line = `[${i + 1}] (${m.sentimenttype || 'neutral'}) ${m.content}`;
-    if (total + line.length > MAX_CONTEXT_CHARS) break;
+    if (total + line.length > maxChars) break;
     lines.push(line);
     total += line.length + 1;
   }
   const filterLabel = filter && filter !== 'all' ? `Filter: ${filter}` : 'Filter: all';
   return [filterLabel, 'Context:', ...lines].join('\n');
+}
+
+function filterCommentsBySentiment(comments, filter) {
+  const sentimentFilter = normalizeFilter(filter);
+  return sentimentFilter
+    ? comments.filter(c => c.sentimenttype === sentimentFilter)
+    : comments;
+}
+
+function buildChunkSystemPrompt(intent) {
+  const base = [
+    'You are summarizing a subset of user comments for a larger report.',
+    'Use ONLY the provided context. If not enough info, say so.',
+    'Do not invent details. Keep it factual.'
+  ];
+  const intentGuide = {
+    summary: 'Provide 4-6 bullet points of key facts from this subset.',
+    'short-notes': 'Provide 5-8 short bullet notes from this subset.',
+    feedback: 'Provide actionable feedback bullets grounded in the comments.'
+  };
+  return [...base, intentGuide[intent] || intentGuide.summary].join(' ');
+}
+
+function buildChunkUserPrompt(intent) {
+  if (intent === 'short-notes') return 'Create short notes from this subset of comments.';
+  if (intent === 'feedback') return 'Provide actionable feedback based on this subset of comments.';
+  return 'Summarize this subset of comments.';
+}
+
+async function summarizeWithMapReduce({ comments, filter, intent, chatProvider }) {
+  const base = filterCommentsBySentiment(comments, filter);
+  if (!base.length) return 'No comments are available for this filter.';
+
+  const chunks = chunkArray(base, SUMMARY_CHUNK_SIZE);
+  const chunkSummaries = [];
+  const chunkSystemPrompt = buildChunkSystemPrompt(intent);
+  const chunkUserPrompt = buildChunkUserPrompt(intent);
+
+  for (const chunk of chunks) {
+    const contextText = buildContext(chunk, filter, MAX_CONTEXT_CHARS);
+    const messages = [
+      { role: 'system', content: chunkSystemPrompt },
+      { role: 'system', content: contextText },
+      { role: 'user', content: chunkUserPrompt }
+    ];
+    const chunkText = await chatProvider.chat(messages, {
+      temperature: 0.2,
+      max_tokens: SUMMARY_CHUNK_MAX_TOKENS
+    });
+    const trimmed = String(chunkText || '').trim();
+    if (trimmed) {
+      chunkSummaries.push(trimmed.slice(0, 1500));
+    }
+  }
+
+  if (!chunkSummaries.length) return 'No comments are available for this filter.';
+
+  const combined = chunkSummaries.map((s, i) => `Chunk ${i + 1} summary:\n${s}`).join('\n\n');
+  const finalSystemPrompt = `${buildSystemPrompt(intent)} Use ONLY the chunk summaries below as context.`;
+  const finalMessages = [
+    { role: 'system', content: finalSystemPrompt },
+    { role: 'system', content: combined },
+    { role: 'user', content: buildUserPrompt(intent) }
+  ];
+  const answer = await chatProvider.chat(finalMessages, {
+    temperature: 0.3,
+    max_tokens: ANSWER_MAX_TOKENS
+  });
+  return String(answer || '').trim();
 }
 
 async function ensureSession(supabase, sessionId, consultationId) {
@@ -285,6 +365,7 @@ function createRagService(options = {}) {
     if (normalizedIntent === 'qa' && !userPrompt) {
       throw new Error('question is required');
     }
+    const filteredComments = filterCommentsBySentiment(cleanedComments, filter);
 
     let activeEmbeddingsProvider = embeddingsProvider;
     try {
@@ -296,6 +377,36 @@ function createRagService(options = {}) {
       });
     } catch (err) {
       activeEmbeddingsProvider = null;
+    }
+
+    const activeSessionId = await ensureSession(supabase, sessionId, consultationId);
+    const includeHistory = normalizedIntent === 'qa';
+    const history = includeHistory ? await loadHistory(supabase, activeSessionId, HISTORY_LIMIT) : [];
+
+    if (MAP_REDUCE_ENABLED && normalizedIntent !== 'qa' && filteredComments.length >= SUMMARY_THRESHOLD) {
+      const answer = await summarizeWithMapReduce({
+        comments: filteredComments,
+        filter,
+        intent: normalizedIntent,
+        chatProvider
+      });
+
+      await appendMessages(supabase, activeSessionId, [
+        { role: 'user', content: userPrompt },
+        { role: 'assistant', content: answer }
+      ]);
+
+      return {
+        sessionId: activeSessionId,
+        answer,
+        intent: normalizedIntent,
+        sources: filteredComments.slice(0, DEFAULT_SUMMARY_TOP_K).map(c => ({
+          comment_id: c.id,
+          content: c.content,
+          sentimenttype: c.sentimenttype,
+          similarity: null
+        }))
+      };
     }
 
     const topK = normalizedIntent === 'qa' ? DEFAULT_TOP_K : DEFAULT_SUMMARY_TOP_K;
@@ -311,10 +422,7 @@ function createRagService(options = {}) {
         topK
       });
     } catch (err) {
-      const filtered = normalizeFilter(filter)
-        ? cleanedComments.filter(c => c.sentimenttype === normalizeFilter(filter))
-        : cleanedComments;
-      matches = filtered.slice(0, topK).map(c => ({
+      matches = filteredComments.slice(0, topK).map(c => ({
         comment_id: c.id,
         consultation_id: consultationId,
         content: c.content,
@@ -324,11 +432,7 @@ function createRagService(options = {}) {
     }
 
     if (!matches || matches.length === 0) {
-      const sentimentFilter = normalizeFilter(filter);
-      const base = sentimentFilter
-        ? cleanedComments.filter(c => c.sentimenttype === sentimentFilter)
-        : cleanedComments;
-      matches = base.slice(0, topK).map(c => ({
+      matches = filteredComments.slice(0, topK).map(c => ({
         comment_id: c.id,
         consultation_id: consultationId,
         content: c.content,
@@ -339,8 +443,6 @@ function createRagService(options = {}) {
 
     const contextText = buildContext(matches, filter);
     const systemPrompt = buildSystemPrompt(normalizedIntent);
-    const activeSessionId = await ensureSession(supabase, sessionId, consultationId);
-    const history = await loadHistory(supabase, activeSessionId, HISTORY_LIMIT);
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -349,7 +451,7 @@ function createRagService(options = {}) {
       { role: 'user', content: userPrompt }
     ];
 
-    const answer = await chatProvider.chat(messages, { temperature: 0.4, max_tokens: 700 });
+    const answer = await chatProvider.chat(messages, { temperature: 0.4, max_tokens: ANSWER_MAX_TOKENS });
 
     await appendMessages(supabase, activeSessionId, [
       { role: 'user', content: userPrompt },
