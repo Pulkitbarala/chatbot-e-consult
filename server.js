@@ -36,7 +36,8 @@ const allowedOrigins = (process.env.CORS_ORIGINS || [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'https://e-consult-zeta.vercel.app',
-  'https://e-consult-backend.vercel.app'
+  'https://e-consult-backend.vercel.app',
+  'https://chatbot-e-consult.vercel.app/rag/chat'
 ].join(',')).split(',').map(s => s.trim()).filter(Boolean);
 
 const corsOptions = {
