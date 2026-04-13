@@ -2,7 +2,7 @@
 // Requires env: OPENROUTER_API_KEY
 // Optional env: OPENROUTER_MODEL, OPENROUTER_APP_URL, OPENROUTER_APP_NAME
 
-const DEFAULT_MODEL = 'mistralai/mistral-7b-instruct:free';
+const DEFAULT_MODEL = 'mistralai/mistral-nemo';
 const fetch = (url, options) => import('node-fetch').then(({ default: f }) => f(url, options));
 
 /**
