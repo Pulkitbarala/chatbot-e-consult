@@ -111,10 +111,14 @@ function sanitizeCommentsPayload(comments) {
   const list = Array.isArray(comments) ? comments : [];
   return list.slice(0, MAX_COMMENTS).map((c) => {
     const content = String(c?.content || '').slice(0, MAX_COMMENT_CHARS);
+    const sentimentRaw = String(c?.sentimenttype || '').toLowerCase();
+    const sentimenttype = ['positive', 'negative', 'neutral'].includes(sentimentRaw)
+      ? sentimentRaw
+      : undefined;
     return {
       id: c?.id,
       content,
-      sentimenttype: c?.sentimenttype,
+      sentimenttype,
     };
   });
 }
@@ -125,13 +129,13 @@ app.get('/health', (req, res) => {
 
 const CommentSchema = z.object({
   id: z.union([z.string(), z.number()]).optional(),
-  content: z.string().min(1).max(MAX_COMMENT_CHARS),
-  sentimenttype: z.enum(['positive', 'negative', 'neutral']).optional(),
+  content: z.string().min(1),
+  sentimenttype: z.string().optional(),
 });
 
 const RagChatSchema = z.object({
   consultationId: z.string().min(1),
-  comments: z.array(CommentSchema).max(MAX_COMMENTS),
+  comments: z.array(CommentSchema),
   filter: z.enum(['positive only', 'negative only', 'all']).optional(),
   question: z.string().max(2000).optional(),
   intent: z.enum(['qa', 'summary', 'short-notes', 'feedback']).optional(),
@@ -223,8 +227,9 @@ app.post('/rag/chat', async (req, res) => {
       return res.status(400).json({ error: 'Invalid request' });
     }
     const { consultationId, comments, filter, question, intent, sessionId } = parsed.data;
+    const safeComments = sanitizeCommentsPayload(comments);
     const rag = getRagService();
-    const result = await rag.chat({ consultationId, comments, filter, question, intent, sessionId });
+    const result = await rag.chat({ consultationId, comments: safeComments, filter, question, intent, sessionId });
     res.json(result);
   } catch (err) {
     sendError(res, err, 400);
