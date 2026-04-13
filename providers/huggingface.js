@@ -3,6 +3,7 @@
 // Uses node-fetch via dynamic import to work in CommonJS.
 
 const DEFAULT_MODEL = 'meta-llama/Llama-3.1-8B-Instruct';
+const HF_INFERENCE_BASE = process.env.HF_INFERENCE_BASE || 'https://router.huggingface.co/hf-inference/models';
 const fetch = (url, options) => import('node-fetch').then(({ default: f }) => f(url, options));
 
 /**
@@ -16,7 +17,7 @@ function createHuggingFaceProvider(options = {}) {
     if (!apiKey) {
       throw new Error('HF_API_KEY not set');
     }
-    const url = `https://api-inference.huggingface.co/models/${encodeURIComponent(model)}`;
+    const url = `${HF_INFERENCE_BASE}/${encodeURIComponent(model)}`;
     const payload = {
       inputs: prompt,
       parameters: {
